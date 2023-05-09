@@ -1,0 +1,24 @@
+<launch>
+    <arg name="arena_mode"/>
+    <node pkg="br_brain" exec="search_grid_follower" name="search_grid_follower">
+        <param name="arena_mode" value="$(var arena_mode)"/>
+    </node>
+    
+    <node pkg="br_brain" exec="valid_map_pub" name="valid_map_pub">
+        <param name="arena_mode" value="$(var arena_mode)"/>
+    </node>
+
+    <node pkg="br_brain" exec="brain" name="brain">
+        <param name="arena_mode" value="$(var arena_mode)"/>
+        <param name="robot_size_x_m" value="0.3"/>
+        <param name="robot_size_y_m" value="0.3"/>
+        <param name="base_link_to_front_m" value="0.1"/>
+        <param name="unload_pose_x_m" value="1.0"/>
+        <param name="unload_pose_y_m" value="1.0"/>
+        <param name="unload_pose_yaw_deg" value="225.0"/>
+
+
+
+    </node>
+
+</launch>
