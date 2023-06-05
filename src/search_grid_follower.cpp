@@ -66,17 +66,19 @@ class Nav2Commander : public rclcpp::Node {
     private:
 
     void activate_search_grid_trajectory(){
+        past_wp += current_wp;
+        current_wp = 0;
         auto goal_msg = nav2_msgs::action::FollowWaypoints::Goal();
 
         if(state != Nav2CommanderState::SEARCHING){
             RCLCPP_FATAL(this->get_logger(), "Illegal state combination occured");
         }
-        else if(current_wp >= this->search_grid_trajectory.size()) {
+        else if(past_wp >= this->search_grid_trajectory.size() - 1) {
             RCLCPP_INFO(this->get_logger(), "***** DONE *****");
             return;
         }
         else
-            for(size_t i = current_wp; i < search_grid_trajectory.size(); i++)
+            for(size_t i = past_wp; i < search_grid_trajectory.size(); i++)
                 goal_msg.poses.push_back(this->search_grid_trajectory.at(i));
         
         auto send_goal_options = rclcpp_action::Client<nav2_msgs::action::FollowWaypoints>::SendGoalOptions();
@@ -109,7 +111,7 @@ class Nav2Commander : public rclcpp::Node {
         rclcpp_action::ClientGoalHandle<nav2_msgs::action::FollowWaypoints>::SharedPtr,
         const std::shared_ptr<const nav2_msgs::action::FollowWaypoints::Feedback> feedback)
     {
-        if(state == Nav2CommanderState::SEARCHING) current_wp = current_wp == 0u ? feedback->current_waypoint;
+        if(state == Nav2CommanderState::SEARCHING) current_wp = feedback->current_waypoint;
         // RCLCPP_DEBUG(this->get_logger(), "Time spent on Nav goal: %f, time left: %f", feedback->navigation_time, feedback->estimated_time_remaining);
     }
 
@@ -130,12 +132,12 @@ class Nav2Commander : public rclcpp::Node {
         else if(state == Nav2CommanderState::SEARCHING){
             if(result.code != rclcpp_action::ResultCode::SUCCEEDED){
                 RCLCPP_ERROR(this->get_logger(), "Search grid following exited prematurely. Try to re-enter search grid by skipping last waypoint ...");
-                current_wp += 1u;
+                past_wp += 1u;
                 state =  Nav2CommanderState::SEARCHING;
                 activate_search_grid_trajectory();
             }
             else{
-                current_wp = std::numeric_limits<size_t>::max();
+                past_wp = std::numeric_limits<size_t>::max();
                 RCLCPP_INFO(this->get_logger(), "\n\n**** !DONE! ****\n\n");
             }
         }
@@ -234,6 +236,7 @@ class Nav2Commander : public rclcpp::Node {
         }
         file.close();
         current_wp = 0u;
+        past_wp = 0u;
         RCLCPP_INFO(this->get_logger(), "Read %lu waypoints from file %s", current_wp, filename.c_str());
     }
 
@@ -263,7 +266,7 @@ class Nav2Commander : public rclcpp::Node {
 
     Nav2CommanderState state = Nav2CommanderState::SEARCHING;
     std::vector<geometry_msgs::msg::PoseStamped> search_grid_trajectory, collect_trajectory;
-    size_t current_wp;
+    size_t current_wp, past_wp;
 
     geometry_msgs::msg::PoseStamped on_exit;
 
