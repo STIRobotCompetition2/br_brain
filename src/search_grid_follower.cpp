@@ -7,117 +7,202 @@
 #include <rclcpp/rclcpp.hpp>
 #include <rclcpp/executor.hpp>
 
-#include <nav2_msgs/action/navigate_to_pose.hpp>
+#include <nav2_msgs/action/navigate_through_poses.hpp>
 
 #include <rclcpp_action/rclcpp_action.hpp>
 #include <eigen3/Eigen/Geometry>
 
-#include <std_msgs/msg/bool.hpp>
+#include <std_msgs/msg/string.hpp>
 #include <std_srvs/srv/set_bool.hpp>
+#include <std_srvs/srv/trigger.hpp>
+#include <geometry_msgs/msg/twist.hpp>
+
+#include <br_brick_management/srv/brick_detection.hpp>
+
+
+#define OFFLOAD_X 0.5
+#define OFFLOAD_Y 0.5
+#define OFFLOAD_YAW 315
+
 
 using namespace std::placeholders;
 
-class SearchGridFollower : public rclcpp::Node {
+enum Nav2CommanderState{
+    SEARCHING,
+    COLLECTING,
+    SEARCHING_TO_COLLECTING
+};
+
+class Nav2Commander : public rclcpp::Node {
     public:
-    SearchGridFollower() : Node("search_grid_follower"), progress(0u), is_active(false), is_on_pattern(true) {
-        this->declare_parameter("arena_mode", false);
+    Nav2Commander() : Node("nav2_commander") {
+        this->declare_parameter("arena_mode", true);
         arena_mode = this->get_parameter("arena_mode").as_bool();
         if(arena_mode) readGridFromFile("/home/svenbecker/Documents/EPFL/Semester_Project/ros2_ws/src/br_brain/config/searchgrid_arena.csv");
         else readGridFromFile("/home/svenbecker/Documents/EPFL/Semester_Project/ros2_ws/src/br_brain/config/searchgrid_spot_small.csv");
 
         
 
-        this->active_pub = this->create_publisher<std_msgs::msg::Bool>("is_active", 1);
-        this->on_pattern_pub = this->create_publisher<std_msgs::msg::Bool>("is_on_pattern", 1);
+        this->state_pub = this->create_publisher<std_msgs::msg::String>("/nav2_commander_state", 1);
+        this->cmd_vel_pub = this->create_publisher<geometry_msgs::msg::Twist>("/cmd_vel", 1);
 
-        this->client_ptr_ = rclcpp_action::create_client<nav2_msgs::action::NavigateToPose>(this,"/navigate_to_pose");
-        if(!this->client_ptr_->wait_for_action_server(std::chrono::seconds(1))) throw std::runtime_error("Cannot find nav2 stack ...");
+        this->client_ptr_ = rclcpp_action::create_client<nav2_msgs::action::NavigateThroughPoses>(this,"/navigate_through_poses");
+        while(!this->client_ptr_->wait_for_action_server(std::chrono::seconds(2u))) RCLCPP_WARN(this->get_logger(), "Cannot find nav2 stack ...");
         set_active_service = this->create_service<std_srvs::srv::SetBool>(
-                "/activate_search_grid_follower",
-                std::bind(&SearchGridFollower::set_active_service_callback, this, _1, _2, _3)
+                "/activate_search_grid_trajectory_follower",
+                std::bind(&Nav2Commander::set_active_service_callback, this, _1, _2, _3)
         );
+        brick_detection_service = this->create_service<br_brick_management::srv::BrickDetection>("/brick_detection", std::bind(&Nav2Commander::brick_detection_callback, this, _1, _2, _3));
+        set_brick_search_active = this->create_client<std_srvs::srv::Trigger>("set_active");
+        while(!set_brick_search_active->wait_for_service(std::chrono::seconds(2u))){
+            RCLCPP_WARN(this->get_logger(), "Brick-detection not yet online");
+        }
+        RCLCPP_INFO(this->get_logger(), "brick-detection ONLINE !");  
 
-        
-
-
-
-        
+        activate_search_grid_trajectory();
     }
     private:
 
-    void send_goal(){
-        auto goal_msg = nav2_msgs::action::NavigateToPose::Goal();
+    void activate_search_grid_trajectory(){
+        auto goal_msg = nav2_msgs::action::NavigateThroughPoses::Goal();
 
-        if(is_on_pattern){
-            goal_msg.pose.pose.position.x = buffer.at(progress).x();
-            goal_msg.pose.pose.position.y = buffer.at(progress).y();
-            goal_msg.pose.pose.orientation.w = std::cos(buffer.at(progress).z() / 2.0);
-            goal_msg.pose.pose.orientation.z = std::sin(buffer.at(progress).z() / 2.0);
-            RCLCPP_INFO(this->get_logger(), "Following next WP (nr. %lu) in search grid ...", progress);
+        if(state != Nav2CommanderState::SEARCHING){
+            RCLCPP_FATAL(this->get_logger(), "Illegal state combination occured");
         }
-        else{
-            goal_msg.pose = on_exit;
-            RCLCPP_INFO(this->get_logger(), "Going back to search grid ...");
-
-
+        else if(search_poses_remaining == 0) {
+            RCLCPP_INFO(this->get_logger(), "***** DONE *****");
+            return;
         }
+        else
+            for(size_t i = search_grid_trajectory.size() - search_poses_remaining; i < search_grid_trajectory.size(); i++)
+                goal_msg.poses.push_back(this->search_grid_trajectory.at(i));
         
-
-
-        goal_msg.pose.header.frame_id = "arena";
-
-        RCLCPP_INFO(this->get_logger(), "Sending goal %f %f",buffer.at(0).x(),buffer.at(0).y());
-
-        auto send_goal_options = rclcpp_action::Client<nav2_msgs::action::NavigateToPose>::SendGoalOptions();
-        // send_goal_options.goal_response_callback = std::bind(&SearchGridFollower::goal_response_callback, this, _1);
-        send_goal_options.feedback_callback = std::bind(&SearchGridFollower::feedback_callback, this, _1, _2);
-        send_goal_options.result_callback = std::bind(&SearchGridFollower::result_callback, this, _1);
+        auto send_goal_options = rclcpp_action::Client<nav2_msgs::action::NavigateThroughPoses>::SendGoalOptions();
+        // send_goal_options.goal_response_callback = std::bind(&Nav2Commander::goal_response_callback, this, _1);
+        send_goal_options.feedback_callback = std::bind(&Nav2Commander::feedback_callback, this, _1, _2);
+        send_goal_options.result_callback = std::bind(&Nav2Commander::result_callback, this, _1);
         client_ptr_->async_send_goal(goal_msg, send_goal_options);
 
 
     }
 
+    void activate_brick_collection(){
+        auto goal_msg = nav2_msgs::action::NavigateThroughPoses::Goal();
+
+        if(state != Nav2CommanderState::COLLECTING){
+            RCLCPP_FATAL(this->get_logger(), "Illegal state combination occured");
+        }
+
+        goal_msg.poses = collect_trajectory;
+        
+        
+        auto send_goal_options = rclcpp_action::Client<nav2_msgs::action::NavigateThroughPoses>::SendGoalOptions();
+        // send_goal_options.goal_response_callback = std::bind(&Nav2Commander::goal_response_callback, this, _1);
+        send_goal_options.feedback_callback = std::bind(&Nav2Commander::feedback_callback, this, _1, _2);
+        send_goal_options.result_callback = std::bind(&Nav2Commander::result_callback, this, _1);
+        client_ptr_->async_send_goal(goal_msg, send_goal_options);
+    }
+
     void feedback_callback(
-        rclcpp_action::ClientGoalHandle<nav2_msgs::action::NavigateToPose>::SharedPtr,
-        const std::shared_ptr<const nav2_msgs::action::NavigateToPose::Feedback> feedback)
+        rclcpp_action::ClientGoalHandle<nav2_msgs::action::NavigateThroughPoses>::SharedPtr,
+        const std::shared_ptr<const nav2_msgs::action::NavigateThroughPoses::Feedback> feedback)
     {
-        if(is_on_pattern) on_exit = feedback->current_pose;
+        if(state = Nav2CommanderState::SEARCHING) search_poses_remaining = feedback->number_of_poses_remaining;
         RCLCPP_DEBUG(this->get_logger(), "Time spent on Nav goal: %f, time left: %f", feedback->navigation_time, feedback->estimated_time_remaining);
     }
 
-    void result_callback(const rclcpp_action::ClientGoalHandle<nav2_msgs::action::NavigateToPose>::WrappedResult & result)
+    void result_callback(const rclcpp_action::ClientGoalHandle<nav2_msgs::action::NavigateThroughPoses>::WrappedResult & result)
     {
-        if(is_active && is_on_pattern) progress++;
-        if(is_active && !is_on_pattern) is_on_pattern = true;
 
-        if(is_active) send_goal();        
+        if(state == Nav2CommanderState::SEARCHING_TO_COLLECTING){
+            if(result.code == rclcpp_action::ResultCode::SUCCEEDED || result.code == rclcpp_action::ResultCode::CANCELED){
+                RCLCPP_INFO(this->get_logger(), "Quit Search Grid following successfully. Collecting bricks now ...");
+            }
+            else{
+                RCLCPP_ERROR(this->get_logger(), "Search grid following quit not as planned. Trying to collect bricks anyway ...");
+
+            }
+            state = Nav2CommanderState::COLLECTING;
+            activate_brick_collection();
+        }
+        else if(state == Nav2CommanderState::SEARCHING){
+            if(result.code != rclcpp_action::ResultCode::SUCCEEDED){
+                RCLCPP_ERROR(this->get_logger(), "Search grid following exited prematurely. Try to re-enter search grid by skipping last waypoint ...");
+                search_poses_remaining -= 1u;
+                activate_search_grid_trajectory();
+            }
+            else{
+                search_poses_remaining = 0u;
+                RCLCPP_INFO(this->get_logger(), "\n\n**** !DONE! ****\n\n");
+            }
+        }
+        else if(state == Nav2CommanderState::COLLECTING){
+            if(result.code != rclcpp_action::ResultCode::SUCCEEDED){
+                RCLCPP_ERROR(this->get_logger(), "Brick Collection ended unsuccessfully. Going back to search grid & change mode of brick-detection ...");
+                
+            }
+            else{
+                RCLCPP_INFO(this->get_logger(), "Unloading brick ...");
+                geometry_msgs::msg::Twist cmd_vel_msg;
+                cmd_vel_msg.linear.x = -0.2;
+                this->cmd_vel_pub->publish(cmd_vel_msg);
+                rclcpp::sleep_for(std::chrono::seconds(2u));
+                cmd_vel_msg.linear.x = 0.0;
+                this->cmd_vel_pub->publish(cmd_vel_msg);
+                RCLCPP_INFO(this->get_logger(), "Brick Collection ended successful. Going back to search grid & change mode of brick-detection ...");
+                
+            }
+            state = Nav2CommanderState::SEARCHING;
+            std_srvs::srv::Trigger::Request::SharedPtr set_active_req;
+            this->set_brick_search_active->async_send_request(set_active_req);
+            activate_search_grid_trajectory();
+        }
+
+
     }
+
+    void brick_detection_callback(
+        const std::shared_ptr<rmw_request_id_t> request_header,
+        const std::shared_ptr<br_brick_management::srv::BrickDetection::Request> request,
+        const std::shared_ptr<br_brick_management::srv::BrickDetection::Response> response
+    ){
+        if(state != Nav2CommanderState::SEARCHING){
+            RCLCPP_FATAL(this->get_logger(), "Invalid state config occured (request to collect another brick while already collecting brick)");
+            response->success = false;
+            return;
+
+
+        }
+        collect_trajectory.clear();
+
+        collect_trajectory.push_back(request->detection);
+        // trajectory.end()->header.frame_id = "arena";
+        geometry_msgs::msg::PoseStamped offload_pose;
+        offload_pose.header.frame_id = "arena";
+        offload_pose.pose.position.x = OFFLOAD_X;
+        offload_pose.pose.position.y = OFFLOAD_Y;
+        offload_pose.pose.orientation.w = std::cos(OFFLOAD_YAW * M_PI / 180.);
+        offload_pose.pose.orientation.z = std::sin(OFFLOAD_YAW * M_PI / 180.);
+        collect_trajectory.push_back(offload_pose);
+
+        RCLCPP_INFO(this->get_logger(), "Received new brick detection at (%f,%f). Built collection trajectory of %u poses. Canceling current navigation goal to exit search mode ...", request->detection.pose.position.x, request->detection.pose.position.y, collect_trajectory.size());
+        state = Nav2CommanderState::SEARCHING_TO_COLLECTING;
+        this->client_ptr_->async_cancel_all_goals();
+        response->success = true;
+    }
+
     void set_active_service_callback(
             const std::shared_ptr<rmw_request_id_t> request_header,
             const std::shared_ptr<std_srvs::srv::SetBool::Request> request,
             const std::shared_ptr<std_srvs::srv::SetBool::Response> response)
     {
-        if(request->data == this->is_active) RCLCPP_WARN(this->get_logger(), "Want to turn on/off search grid follower but requested (%s) state is already set", is_active ? "active" : "inactive");
-        else{
-            this->is_active = request->data;
-            std_msgs::msg::Bool msg;
-            msg.data = this->is_active;
-            this->active_pub->publish(msg);
-            
-            if(this->is_active) send_goal();
-            else {
-                this->is_on_pattern = false;
-                this->client_ptr_->async_cancel_all_goals();
-            }
-            RCLCPP_INFO(this->get_logger(), "Changed mode successfully to %s!", is_active ? "active" : "inactive");
-        }
         response->success = true;
     }
 
 
 
     void readGridFromFile(std::string filename = "/home/svenbecker/Documents/EPFL/Semester_Project/ros2_ws/src/br_brain/config/searchgrid_arena.csv"){
-        buffer.clear();
+        search_grid_trajectory.clear();
         std::ifstream file(filename);
 
         std::string line;
@@ -126,36 +211,66 @@ class SearchGridFollower : public rclcpp::Node {
             std::vector<std::string> row;
             std::stringstream ss(line);
             std::string cell;
-            Eigen::Vector3d to_add(Eigen::Vector3d::Zero());
+            Eigen::Vector3d to_add_eigen(Eigen::Vector3d::Zero());
             size_t i = 0;
             while (getline(ss, cell, ',')) {
-                to_add[i] = std::stod(cell);
+                to_add_eigen[i] = std::stod(cell);
                 i++;
             }
-            to_add.z() *= M_PI / 180.;
-            buffer.push_back(to_add);
+            to_add_eigen.z() *= M_PI / 180.;
+            geometry_msgs::msg::PoseStamped to_add_pose_stamped;
+            to_add_pose_stamped.header.frame_id = "arena";
+            to_add_pose_stamped.pose.position.x = to_add_eigen.x();
+            to_add_pose_stamped.pose.position.y = to_add_eigen.y();
+            to_add_pose_stamped.pose.orientation.z = std::sin(0.5 * to_add_eigen.z());
+            to_add_pose_stamped.pose.orientation.w = std::cos(0.5 * to_add_eigen.z());
+            search_grid_trajectory.push_back(to_add_pose_stamped);
         }
         file.close();
-        RCLCPP_INFO(this->get_logger(), "Read %lu waypoints from file %s", buffer.size(), filename.c_str());
+        search_poses_remaining = search_grid_trajectory.size();
+        RCLCPP_INFO(this->get_logger(), "Read %lu waypoints from file %s", search_poses_remaining, filename.c_str());
     }
 
-    bool is_active;
-    bool is_on_pattern;
-    std::vector<Eigen::Vector3d> buffer;
-    geometry_msgs::msg::PoseStamped on_exit;
-    size_t progress;
+    std_msgs::msg::String state2stringmsg(){
+        std::string state_str;
+        switch(this->state){
+            case Nav2CommanderState::SEARCHING:
+            state_str = std::string("searching");
+            break;
+            case Nav2CommanderState::COLLECTING:
+            state_str = std::string("collecting");
+            break;
+            case Nav2CommanderState::SEARCHING_TO_COLLECTING:
+            state_str = std::string("transition ongoing: searching to collection");
+            break;
+            default:
+            throw std::runtime_error("nav2 commander found unknown state");
+        }
+        std_msgs::msg::String out_msg;
+        out_msg.data = state_str;
+        return out_msg;
+    }
 
-    rclcpp_action::Client<nav2_msgs::action::NavigateToPose>::SharedPtr client_ptr_;
+    Nav2CommanderState state = Nav2CommanderState::SEARCHING;
+    std::vector<geometry_msgs::msg::PoseStamped> search_grid_trajectory, collect_trajectory;
+    size_t search_poses_remaining;
+
+    geometry_msgs::msg::PoseStamped on_exit;
+
+    rclcpp_action::Client<nav2_msgs::action::NavigateThroughPoses>::SharedPtr client_ptr_;
     // rclcpp::TimerBase::SharedPtr timer_;
-    rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr active_pub, on_pattern_pub;
+    rclcpp::Publisher<std_msgs::msg::String>::SharedPtr state_pub;
+    rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr cmd_vel_pub;
     rclcpp::Service<std_srvs::srv::SetBool>::SharedPtr set_active_service;
+    rclcpp::Client<std_srvs::srv::Trigger>::SharedPtr set_brick_search_active;
+    rclcpp::Service<br_brick_management::srv::BrickDetection>::SharedPtr brick_detection_service;
 
     bool arena_mode;
 };
 
 int main(int argc, char** argv){
     rclcpp::init(argc, argv);
-    SearchGridFollower::SharedPtr sgf(new SearchGridFollower());
+    Nav2Commander::SharedPtr sgf(new Nav2Commander());
     rclcpp::spin(sgf);
 
 }

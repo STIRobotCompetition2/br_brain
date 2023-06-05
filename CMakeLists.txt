@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.8)
 project(br_brain)
 
 if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
-  add_compile_options(-Wall -Wextra -Wpedantic)
+  add_compile_options(-Wall -Wextra -Wpedantic -g)
 endif()
 
 # find dependencies
@@ -51,7 +51,7 @@ target_link_libraries (search_grid_follower Eigen3::Eigen)
 
 add_executable(valid_map_pub src/valid_map_pub.cpp)
 
-add_executable(brain src/brain.cpp)
+# add_executable(brain src/brain.cpp)
 
 
 
@@ -77,20 +77,21 @@ ament_target_dependencies(
   grid_map_ros
   grid_map_core
   std_msgs
-)
-
-ament_target_dependencies(
-  brain
-  rclcpp
-  rclcpp_action
-  std_srvs
-  nav_msgs
-  nav2_msgs
-  grid_map_ros
-  grid_map_core
-  std_msgs
   br_brick_management
 )
+
+# ament_target_dependencies(
+#   brain
+#   rclcpp
+#   rclcpp_action
+#   std_srvs
+#   nav_msgs
+#   nav2_msgs
+#   grid_map_ros
+#   grid_map_core
+#   std_msgs
+#   br_brick_management
+# )
 
 install(TARGETS
   search_grid_follower 
@@ -104,10 +105,10 @@ install(TARGETS
   DESTINATION lib/${PROJECT_NAME}/
 )
 
-install(TARGETS
-  brain 
-  DESTINATION lib/${PROJECT_NAME}/
-)
+# install(TARGETS
+#   brain 
+#   DESTINATION lib/${PROJECT_NAME}/
+# )
 
 install(DIRECTORY
   launch
