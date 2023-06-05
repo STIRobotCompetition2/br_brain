@@ -7,7 +7,7 @@
 #include <rclcpp/rclcpp.hpp>
 #include <rclcpp/executor.hpp>
 
-#include <nav2_msgs/action/navigate_through_poses.hpp>
+#include <nav2_msgs/action/follow_waypoints.hpp>
 
 #include <rclcpp_action/rclcpp_action.hpp>
 #include <eigen3/Eigen/Geometry>
@@ -46,7 +46,7 @@ class Nav2Commander : public rclcpp::Node {
         this->state_pub = this->create_publisher<std_msgs::msg::String>("/nav2_commander_state", 1);
         this->cmd_vel_pub = this->create_publisher<geometry_msgs::msg::Twist>("/cmd_vel", 1);
 
-        this->client_ptr_ = rclcpp_action::create_client<nav2_msgs::action::NavigateThroughPoses>(this,"/navigate_through_poses");
+        this->client_ptr_ = rclcpp_action::create_client<nav2_msgs::action::FollowWaypoints>(this,"/follow_waypoints");
         while(!this->client_ptr_->wait_for_action_server(std::chrono::seconds(2u))) RCLCPP_WARN(this->get_logger(), "Cannot find nav2 stack ...");
         set_active_service = this->create_service<std_srvs::srv::SetBool>(
                 "/activate_search_grid_trajectory_follower",
@@ -59,25 +59,27 @@ class Nav2Commander : public rclcpp::Node {
         }
         RCLCPP_INFO(this->get_logger(), "brick-detection ONLINE !");  
 
+        state_pub_timer = this->create_wall_timer(std::chrono::milliseconds(200), std::bind(&Nav2Commander::pubState, this));
+
         activate_search_grid_trajectory();
     }
     private:
 
     void activate_search_grid_trajectory(){
-        auto goal_msg = nav2_msgs::action::NavigateThroughPoses::Goal();
+        auto goal_msg = nav2_msgs::action::FollowWaypoints::Goal();
 
         if(state != Nav2CommanderState::SEARCHING){
             RCLCPP_FATAL(this->get_logger(), "Illegal state combination occured");
         }
-        else if(search_poses_remaining == 0) {
+        else if(current_wp >= this->search_grid_trajectory.size()) {
             RCLCPP_INFO(this->get_logger(), "***** DONE *****");
             return;
         }
         else
-            for(size_t i = search_grid_trajectory.size() - search_poses_remaining; i < search_grid_trajectory.size(); i++)
+            for(size_t i = current_wp; i < search_grid_trajectory.size(); i++)
                 goal_msg.poses.push_back(this->search_grid_trajectory.at(i));
         
-        auto send_goal_options = rclcpp_action::Client<nav2_msgs::action::NavigateThroughPoses>::SendGoalOptions();
+        auto send_goal_options = rclcpp_action::Client<nav2_msgs::action::FollowWaypoints>::SendGoalOptions();
         // send_goal_options.goal_response_callback = std::bind(&Nav2Commander::goal_response_callback, this, _1);
         send_goal_options.feedback_callback = std::bind(&Nav2Commander::feedback_callback, this, _1, _2);
         send_goal_options.result_callback = std::bind(&Nav2Commander::result_callback, this, _1);
@@ -87,7 +89,7 @@ class Nav2Commander : public rclcpp::Node {
     }
 
     void activate_brick_collection(){
-        auto goal_msg = nav2_msgs::action::NavigateThroughPoses::Goal();
+        auto goal_msg = nav2_msgs::action::FollowWaypoints::Goal();
 
         if(state != Nav2CommanderState::COLLECTING){
             RCLCPP_FATAL(this->get_logger(), "Illegal state combination occured");
@@ -96,7 +98,7 @@ class Nav2Commander : public rclcpp::Node {
         goal_msg.poses = collect_trajectory;
         
         
-        auto send_goal_options = rclcpp_action::Client<nav2_msgs::action::NavigateThroughPoses>::SendGoalOptions();
+        auto send_goal_options = rclcpp_action::Client<nav2_msgs::action::FollowWaypoints>::SendGoalOptions();
         // send_goal_options.goal_response_callback = std::bind(&Nav2Commander::goal_response_callback, this, _1);
         send_goal_options.feedback_callback = std::bind(&Nav2Commander::feedback_callback, this, _1, _2);
         send_goal_options.result_callback = std::bind(&Nav2Commander::result_callback, this, _1);
@@ -104,14 +106,14 @@ class Nav2Commander : public rclcpp::Node {
     }
 
     void feedback_callback(
-        rclcpp_action::ClientGoalHandle<nav2_msgs::action::NavigateThroughPoses>::SharedPtr,
-        const std::shared_ptr<const nav2_msgs::action::NavigateThroughPoses::Feedback> feedback)
+        rclcpp_action::ClientGoalHandle<nav2_msgs::action::FollowWaypoints>::SharedPtr,
+        const std::shared_ptr<const nav2_msgs::action::FollowWaypoints::Feedback> feedback)
     {
-        if(state = Nav2CommanderState::SEARCHING) search_poses_remaining = feedback->number_of_poses_remaining;
-        RCLCPP_DEBUG(this->get_logger(), "Time spent on Nav goal: %f, time left: %f", feedback->navigation_time, feedback->estimated_time_remaining);
+        if(state == Nav2CommanderState::SEARCHING) current_wp = current_wp == 0u ? feedback->current_waypoint;
+        // RCLCPP_DEBUG(this->get_logger(), "Time spent on Nav goal: %f, time left: %f", feedback->navigation_time, feedback->estimated_time_remaining);
     }
 
-    void result_callback(const rclcpp_action::ClientGoalHandle<nav2_msgs::action::NavigateThroughPoses>::WrappedResult & result)
+    void result_callback(const rclcpp_action::ClientGoalHandle<nav2_msgs::action::FollowWaypoints>::WrappedResult & result)
     {
 
         if(state == Nav2CommanderState::SEARCHING_TO_COLLECTING){
@@ -128,11 +130,12 @@ class Nav2Commander : public rclcpp::Node {
         else if(state == Nav2CommanderState::SEARCHING){
             if(result.code != rclcpp_action::ResultCode::SUCCEEDED){
                 RCLCPP_ERROR(this->get_logger(), "Search grid following exited prematurely. Try to re-enter search grid by skipping last waypoint ...");
-                search_poses_remaining -= 1u;
+                current_wp += 1u;
+                state =  Nav2CommanderState::SEARCHING;
                 activate_search_grid_trajectory();
             }
             else{
-                search_poses_remaining = 0u;
+                current_wp = std::numeric_limits<size_t>::max();
                 RCLCPP_INFO(this->get_logger(), "\n\n**** !DONE! ****\n\n");
             }
         }
@@ -146,14 +149,14 @@ class Nav2Commander : public rclcpp::Node {
                 geometry_msgs::msg::Twist cmd_vel_msg;
                 cmd_vel_msg.linear.x = -0.2;
                 this->cmd_vel_pub->publish(cmd_vel_msg);
-                rclcpp::sleep_for(std::chrono::seconds(2u));
+                rclcpp::sleep_for(std::chrono::seconds(10u));
                 cmd_vel_msg.linear.x = 0.0;
                 this->cmd_vel_pub->publish(cmd_vel_msg);
                 RCLCPP_INFO(this->get_logger(), "Brick Collection ended successful. Going back to search grid & change mode of brick-detection ...");
                 
             }
             state = Nav2CommanderState::SEARCHING;
-            std_srvs::srv::Trigger::Request::SharedPtr set_active_req;
+            std_srvs::srv::Trigger::Request::SharedPtr set_active_req(new std_srvs::srv::Trigger::Request());
             this->set_brick_search_active->async_send_request(set_active_req);
             activate_search_grid_trajectory();
         }
@@ -184,10 +187,13 @@ class Nav2Commander : public rclcpp::Node {
         offload_pose.pose.orientation.w = std::cos(OFFLOAD_YAW * M_PI / 180.);
         offload_pose.pose.orientation.z = std::sin(OFFLOAD_YAW * M_PI / 180.);
         collect_trajectory.push_back(offload_pose);
+        collect_trajectory.push_back(offload_pose);
 
         RCLCPP_INFO(this->get_logger(), "Received new brick detection at (%f,%f). Built collection trajectory of %u poses. Canceling current navigation goal to exit search mode ...", request->detection.pose.position.x, request->detection.pose.position.y, collect_trajectory.size());
         state = Nav2CommanderState::SEARCHING_TO_COLLECTING;
+
         this->client_ptr_->async_cancel_all_goals();
+
         response->success = true;
     }
 
@@ -227,8 +233,8 @@ class Nav2Commander : public rclcpp::Node {
             search_grid_trajectory.push_back(to_add_pose_stamped);
         }
         file.close();
-        search_poses_remaining = search_grid_trajectory.size();
-        RCLCPP_INFO(this->get_logger(), "Read %lu waypoints from file %s", search_poses_remaining, filename.c_str());
+        current_wp = 0u;
+        RCLCPP_INFO(this->get_logger(), "Read %lu waypoints from file %s", current_wp, filename.c_str());
     }
 
     std_msgs::msg::String state2stringmsg(){
@@ -251,19 +257,24 @@ class Nav2Commander : public rclcpp::Node {
         return out_msg;
     }
 
+    void pubState(){
+        state_pub->publish(state2stringmsg());
+    }
+
     Nav2CommanderState state = Nav2CommanderState::SEARCHING;
     std::vector<geometry_msgs::msg::PoseStamped> search_grid_trajectory, collect_trajectory;
-    size_t search_poses_remaining;
+    size_t current_wp;
 
     geometry_msgs::msg::PoseStamped on_exit;
 
-    rclcpp_action::Client<nav2_msgs::action::NavigateThroughPoses>::SharedPtr client_ptr_;
+    rclcpp_action::Client<nav2_msgs::action::FollowWaypoints>::SharedPtr client_ptr_;
     // rclcpp::TimerBase::SharedPtr timer_;
     rclcpp::Publisher<std_msgs::msg::String>::SharedPtr state_pub;
     rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr cmd_vel_pub;
     rclcpp::Service<std_srvs::srv::SetBool>::SharedPtr set_active_service;
     rclcpp::Client<std_srvs::srv::Trigger>::SharedPtr set_brick_search_active;
     rclcpp::Service<br_brick_management::srv::BrickDetection>::SharedPtr brick_detection_service;
+    rclcpp::TimerBase::SharedPtr state_pub_timer;
 
     bool arena_mode;
 };
