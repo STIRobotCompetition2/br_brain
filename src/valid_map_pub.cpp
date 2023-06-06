@@ -66,8 +66,8 @@ struct ZoneContructor{
         const std::vector<size_t>& configuration, 
         std::shared_ptr<nav_msgs::msg::OccupancyGrid>& output_map, 
         const double resolution,
-        const float occupied_value = 254, 
-        const float free_value = 0
+        const float occupied_value = 1.0, 
+        const float free_value = 0.0
     ){
         grid_map::GridMap out_map_grid_map;
         out_map_grid_map.setFrameId(MAP_FRAME);
